@@ -44,6 +44,7 @@ export default function SignLanguagePage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const animationFrameId = useRef<number | null>(null);
 
+  // Initialize the HandLandmarker model
   useEffect(() => {
     const createHandLandmarker = async () => {
       try {
@@ -71,116 +72,118 @@ export default function SignLanguagePage() {
     }
   }, []);
 
+  // Effect to manage the prediction loop
   useEffect(() => {
-    return () => {
-      stopCamera();
+    let lastVideoTime = -1;
+    const predict = () => {
+      const video = videoRef.current;
+      if (!isCameraActive || !video || !handLandmarker || video.readyState < 2) {
+        animationFrameId.current = requestAnimationFrame(predict);
+        return;
+      }
+
+      if (video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+        const results = handLandmarker.detectForVideo(video, Date.now());
+        
+        const canvas = canvasRef.current;
+        const canvasCtx = canvas?.getContext("2d");
+        if (canvas && canvasCtx) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const drawingUtils = new DrawingUtils(canvasCtx);
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+
+            if (results.landmarks && results.landmarks.length > 0) {
+              setHandDetected(true);
+              for (const landmarks of results.landmarks) {
+                drawingUtils.drawConnectors(landmarks, HandLandmarker.HAND_CONNECTIONS, { color: "#00FF00", lineWidth: 3 });
+                drawingUtils.drawLandmarks(landmarks, { color: "#FF0000", lineWidth: 2, radius: 3 });
+              }
+              const handedness = results.handednesses[0][0].categoryName as 'Left' | 'Right';
+              const landmarks = results.landmarks[0];
+              const fingers = countFingers(landmarks, handedness);
+              setFingerCount(fingers);
+
+              const gesture = detectGesture(landmarks, fingers);
+              if (gesture.name && gesture.confidence > 0.85) {
+                if (gesture.name !== detectedGesture) {
+                  setDetectedGesture(gesture.name);
+                  setConfidence(gesture.confidence);
+                  const command = gestureCommands.find((cmd) => cmd.gesture === gesture.name);
+                  if (command) processGestureCommand(command);
+                }
+              } else {
+                if (detectedGesture) setDetectedGesture("");
+              }
+            } else {
+              setHandDetected(false);
+            }
+            canvasCtx.restore();
+        }
+      }
+      animationFrameId.current = requestAnimationFrame(predict);
     };
-  }, []);
+
+    if (isCameraActive) {
+      animationFrameId.current = requestAnimationFrame(predict);
+    } else {
+      if (animationFrameId.current) {
+        cancelAnimationFrame(animationFrameId.current);
+      }
+    }
+
+    return () => {
+      if (animationFrameId.current) {
+        cancelAnimationFrame(animationFrameId.current);
+      }
+    };
+  }, [isCameraActive, handLandmarker, detectedGesture]); // Rerun effect when camera or model changes
+
 
   const startCamera = async () => {
-    if (!handLandmarker || isCameraActive) return;
-    setIsCameraActive(true);
-
+    if (isCameraActive || isLoading) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480, facingMode: "user" },
       });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.addEventListener("loadeddata", predictWebcam);
+        setIsCameraActive(true);
       }
     } catch (error) {
       console.error("Error accessing camera:", error);
       alert("Unable to access camera. Please check permissions.");
-      setIsCameraActive(false);
     }
   };
 
   const stopCamera = () => {
-    setIsCameraActive(false);
-    if (animationFrameId.current) {
-      cancelAnimationFrame(animationFrameId.current);
-    }
-    if (videoRef.current && videoRef.current.srcObject) {
+    if (!isCameraActive) return;
+    if (videoRef.current?.srcObject) {
       (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
       videoRef.current.srcObject = null;
     }
-    const canvas = canvasRef.current;
-    if (canvas) {
-        const canvasCtx = canvas.getContext("2d");
-        canvasCtx?.clearRect(0, 0, canvas.width, canvas.height);
-    }
+    setIsCameraActive(false);
+    setDetectedGesture("");
+    setHandDetected(false);
   };
-
-  const predictWebcam = () => {
-    const video = videoRef.current;
-    if (!video || video.readyState < 2 || !handLandmarker) {
-      if (isCameraActive) {
-        animationFrameId.current = requestAnimationFrame(predictWebcam);
-      }
-      return;
-    }
-    
-    const canvas = canvasRef.current;
-    const canvasCtx = canvas?.getContext("2d");
-    if (!canvas || !canvasCtx) return;
-
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-
-    const results = handLandmarker.detectForVideo(video, Date.now());
-
-    canvasCtx.save();
-    canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
-    const drawingUtils = new DrawingUtils(canvasCtx);
-
-    if (results.landmarks && results.landmarks.length > 0) {
-      setHandDetected(true);
-      const landmarks = results.landmarks[0];
-      
-      drawingUtils.drawLandmarks(landmarks, { color: "#FF0000", lineWidth: 2, radius: 3 });
-      drawingUtils.drawConnectors(landmarks, HandLandmarker.HAND_CONNECTIONS, { color: "#00FF00", lineWidth: 3 });
-
-      const handedness = results.handednesses[0][0].categoryName;
-      const fingers = countFingers(landmarks, handedness);
-      setFingerCount(fingers);
-
-      const gesture = detectGesture(landmarks, fingers, handedness);
-      if (gesture.name && gesture.confidence > 0.8) {
-        if(gesture.name !== detectedGesture) {
-            setDetectedGesture(gesture.name);
-            setConfidence(gesture.confidence);
-            const command = gestureCommands.find((cmd) => cmd.gesture === gesture.name);
-            if (command) processGestureCommand(command);
-        }
-      } else {
-         if(detectedGesture !== "") setDetectedGesture("");
-      }
-    } else {
-      setHandDetected(false);
-    }
-    canvasCtx.restore();
-
-    if (isCameraActive) {
-      animationFrameId.current = requestAnimationFrame(predictWebcam);
-    }
-  };
-
+  
   const countFingers = (landmarks: any[], handedness: 'Left' | 'Right') => {
     if (!landmarks || landmarks.length < 21) return 0;
     
     let fingers = 0;
     const tipIds = [4, 8, 12, 16, 20]; // Thumb, Index, Middle, Ring, Pinky
-    const pipIds = [2, 6, 10, 14, 18];
+    const pipIds = [3, 6, 10, 14, 18]; // IP for thumb, PIP for others
 
-    // Thumb: Compare x-coordinate based on handedness
-    if (handedness === 'Right') { // Appears as left hand in mirrored view
-        if (landmarks[tipIds[0]].x > landmarks[pipIds[0]].x) fingers++;
-    } else { // Left hand
-        if (landmarks[tipIds[0]].x < landmarks[pipIds[0]].x) fingers++;
+    // For a mirrored view, user's right hand is detected as 'Left'
+    if (handedness === 'Left') {
+      if (landmarks[tipIds[0]].x < landmarks[pipIds[0]].x) fingers++; // Right hand thumb
+    } else {
+      if (landmarks[tipIds[0]].x > landmarks[pipIds[0]].x) fingers++; // Left hand thumb
     }
-
-    // Other 4 fingers: Compare y-coordinate
+    
+    // Other 4 fingers
     for (let i = 1; i < 5; i++) {
         if (landmarks[tipIds[i]].y < landmarks[pipIds[i]].y) {
             fingers++;
@@ -189,18 +192,18 @@ export default function SignLanguagePage() {
     return fingers;
   };
 
-  const detectGesture = (landmarks: any[], fingerCount: number, handedness: 'Left' | 'Right') => {
-     if (!landmarks || landmarks.length < 21) return { name: "", confidence: 0 };
+  const detectGesture = (landmarks: any[], fingerCount: number) => {
+    if (!landmarks || landmarks.length < 21) return { name: "", confidence: 0 };
     
     let gestureName = "";
-    let confidence = 0.8;
+    let confidence = 0.9;
 
-    // Thumbs up gesture
+    // A more reliable Thumbs Up gesture check
     const thumbTip = landmarks[4];
     const indexPip = landmarks[6];
-    const pinkyPip = landmarks[18];
-    if (fingerCount === 1 && thumbTip.y < indexPip.y && thumbTip.y < pinkyPip.y) {
-        return { name: "Thumbs Up", confidence: 0.9 };
+    const pinkyMcp = landmarks[17];
+    if (fingerCount === 1 && thumbTip.y < indexPip.y && thumbTip.y < pinkyMcp.y) {
+        return { name: "Thumbs Up", confidence: 0.95 };
     }
 
     switch (fingerCount) {
@@ -208,7 +211,6 @@ export default function SignLanguagePage() {
         case 1: gestureName = "One Finger"; break;
         case 2: gestureName = "Two Fingers"; break;
         case 3: gestureName = "Three Fingers"; break;
-        case 4: gestureName = "Four Fingers"; break;
         case 5: gestureName = "Open Palm"; break;
     }
     
@@ -235,7 +237,7 @@ export default function SignLanguagePage() {
       setIsProcessing(false);
 
       if (typeof window !== "undefined" && 'vibrate' in navigator) {
-        if (command.action === "emergency") navigator.vibrate([200, 100, 200, 100, 200]);
+        if (command.action === "emergency") navigator.vibrate([200, 100, 200]);
         else navigator.vibrate(100);
       }
 
@@ -248,7 +250,8 @@ export default function SignLanguagePage() {
       setTimeout(() => setResponse(""), 4000);
     }, 500);
   };
-
+  
+  // The rest of the return statement (JSX) is the same as before
   return (
     <div className="min-h-screen bg-gradient-to-br from-green-50 to-emerald-100">
       <header className="bg-white shadow-sm border-b">
@@ -414,3 +417,4 @@ export default function SignLanguagePage() {
     </div>
   )
 }
+
