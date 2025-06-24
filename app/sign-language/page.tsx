@@ -6,6 +6,11 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Badge } from "@/components/ui/badge"
 import { Camera, CameraOff, ArrowLeft, Hand, CheckCircle, AlertCircle, Loader2 } from "lucide-react"
 import Link from "next/link"
+import {
+  HandLandmarker,
+  FilesetResolver,
+  DrawingUtils
+} from "@mediapipe/tasks-vision";
 
 interface GestureCommand {
   gesture: string
@@ -25,358 +30,221 @@ const gestureCommands: GestureCommand[] = [
 
 export default function SignLanguagePage() {
   const [isCameraActive, setIsCameraActive] = useState(false)
-  const [cameraSupported, setCameraSupported] = useState(false)
+  const [cameraSupported, setCameraSupported] = useState(true);
   const [detectedGesture, setDetectedGesture] = useState<string>("")
   const [confidence, setConfidence] = useState<number>(0)
   const [response, setResponse] = useState<string>("")
   const [isProcessing, setIsProcessing] = useState(false)
   const [handDetected, setHandDetected] = useState(false)
   const [fingerCount, setFingerCount] = useState<number>(0)
-  const [mediaPipeLoaded, setMediaPipeLoaded] = useState(false)
-  const [isLoading, setIsLoading] = useState(false)
-  const videoRef = useRef<HTMLVideoElement>(null)
-  const canvasRef = useRef<HTMLCanvasElement>(null)
-  const streamRef = useRef<MediaStream | null>(null)
-  const animationRef = useRef<number>()
-  const handsRef = useRef<any>(null)
+  const [isLoading, setIsLoading] = useState(true);
+  const [handLandmarker, setHandLandmarker] = useState<HandLandmarker | undefined>(undefined);
 
-  // --- add just below the hooks ---
-  async function loadMediaPipeModules() {
-    setIsLoading(true)
-
-    const [{ Hands, HAND_CONNECTIONS }, { drawConnectors, drawLandmarks }, { Camera }] = await Promise.all([
-      import("@mediapipe/hands"), // hand landmark model
-      import("@mediapipe/drawing_utils"), // helpers to draw
-      import("@mediapipe/camera_utils"), // util to pipe cam frames
-    ])
-
-    handsRef.current = new Hands({
-      locateFile: (file: string) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
-    })
-    handsRef.current.setOptions({
-      maxNumHands: 1,
-      modelComplexity: 1,
-      minDetectionConfidence: 0.55,
-      minTrackingConfidence: 0.55,
-    })(
-      // adapter so we can use the draw helpers later
-      window as any,
-    ).MP_DRAW = { drawConnectors, drawLandmarks, HAND_CONNECTIONS }
-
-    handsRef.current.onResults(onHandsResults)
-    setMediaPipeLoaded(true)
-    setIsLoading(false)
-  }
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const animationFrameId = useRef<number | null>(null);
 
   useEffect(() => {
-    // Check camera support
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      setCameraSupported(true)
-    }
-
-    // Load MediaPipe Hands
-    if (cameraSupported) {
-      loadMediaPipeModules()
-    }
+    const createHandLandmarker = async () => {
+      try {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.12/wasm"
+        );
+        const landmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+            delegate: "GPU"
+          },
+          runningMode: "VIDEO",
+          numHands: 1
+        });
+        setHandLandmarker(landmarker);
+        setIsLoading(false);
+      } catch (error) {
+        console.error("Error creating HandLandmarker:", error);
+        setCameraSupported(false);
+        setIsLoading(false);
+      }
+    };
+    createHandLandmarker();
 
     return () => {
-      stopCamera()
-    }
-  }, [])
-
-  const onHandsResults = (results: any) => {
-    if (!canvasRef.current || !videoRef.current) return
-
-    const canvas = canvasRef.current
-    const ctx = canvas.getContext("2d")
-    if (!ctx) return
-
-    // Clear canvas
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-
-    // Draw video frame
-    ctx.drawImage(videoRef.current, 0, 0, canvas.width, canvas.height)
-
-    if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-      setHandDetected(true)
-
-      const landmarks = results.multiHandLandmarks[0]
-
-      // Draw hand landmarks
-      const { drawConnectors, drawLandmarks, HAND_CONNECTIONS } = (window as any).MP_DRAW
-
-      drawConnectors(ctx, landmarks, HAND_CONNECTIONS, {
-        color: "#00FF00",
-        lineWidth: 2,
-      })
-      drawLandmarks(ctx, landmarks, { color: "#FF0000", lineWidth: 1 })
-
-      // Count fingers and detect gestures
-      const fingers = countFingers(landmarks)
-      setFingerCount(fingers)
-
-      const gesture = detectGesture(landmarks, fingers)
-      if (gesture.name && gesture.confidence > 0.7) {
-        setDetectedGesture(gesture.name)
-        setConfidence(gesture.confidence)
-
-        if (gesture.confidence > 0.85) {
-          const command = gestureCommands.find((cmd) => cmd.gesture === gesture.name)
-          if (command) {
-            processGestureCommand(command)
-          }
+        // Cleanup on component unmount
+        if (animationFrameId.current) {
+            cancelAnimationFrame(animationFrameId.current);
         }
-      } else {
-        setConfidence(Math.max(0, confidence - 0.1))
-        if (confidence < 0.3) {
-          setDetectedGesture("")
-        }
-      }
-    } else {
-      setHandDetected(false)
-      setFingerCount(0)
-      setDetectedGesture("")
-      setConfidence(0)
     }
-  }
-
-  const countFingers = (landmarks: any[]) => {
-    if (!landmarks || landmarks.length < 21) return 0
-
-    let fingers = 0
-
-    // Thumb (compare x coordinates)
-    if (landmarks[4].x > landmarks[3].x) fingers++
-
-    // Other fingers (compare y coordinates)
-    const fingerTips = [8, 12, 16, 20] // Index, Middle, Ring, Pinky
-    const fingerPips = [6, 10, 14, 18]
-
-    for (let i = 0; i < fingerTips.length; i++) {
-      if (landmarks[fingerTips[i]].y < landmarks[fingerPips[i]].y) {
-        fingers++
-      }
-    }
-
-    return fingers
-  }
-
-  const detectGesture = (landmarks: any[], fingerCount: number) => {
-    if (!landmarks || landmarks.length < 21) {
-      return { name: "", confidence: 0 }
-    }
-
-    let gestureName = ""
-    let confidence = 0
-
-    // Detect gestures based on finger count and hand shape
-    switch (fingerCount) {
-      case 0:
-        gestureName = "Closed Fist"
-        confidence = 0.9
-        break
-      case 1:
-        // Check if it's thumbs up or pointing
-        if (landmarks[4].y < landmarks[3].y && landmarks[8].y > landmarks[6].y) {
-          gestureName = "Thumbs Up"
-          confidence = 0.85
-        } else if (landmarks[8].y < landmarks[6].y) {
-          gestureName = "One Finger"
-          confidence = 0.8
-        }
-        break
-      case 2:
-        gestureName = "Two Fingers"
-        confidence = 0.8
-        break
-      case 3:
-        gestureName = "Three Fingers"
-        confidence = 0.8
-        break
-      case 5:
-        gestureName = "Open Palm"
-        confidence = 0.9
-        break
-      default:
-        gestureName = ""
-        confidence = 0
-    }
-
-    return { name: gestureName, confidence }
-  }
+  }, []);
 
   const startCamera = async () => {
+    if (!handLandmarker) return;
+    setIsCameraActive(true);
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: 640,
-          height: 480,
-          facingMode: "user",
-        },
-      })
+        video: { width: 640, height: 480, facingMode: "user" },
+      });
 
       if (videoRef.current) {
-        videoRef.current.srcObject = stream
-        streamRef.current = stream
-        setIsCameraActive(true)
-
-        videoRef.current.onloadedmetadata = () => {
-          if (canvasRef.current && videoRef.current) {
-            canvasRef.current.width = videoRef.current.videoWidth
-            canvasRef.current.height = videoRef.current.videoHeight
-          }
-
-          if (mediaPipeLoaded) {
-            startMediaPipeDetection()
-          } else {
-            startBasicDetection()
-          }
-        }
+        videoRef.current.srcObject = stream;
+        videoRef.current.addEventListener("loadeddata", predictWebcam);
       }
     } catch (error) {
-      console.error("Error accessing camera:", error)
-      alert("Unable to access camera. Please check permissions.")
+      console.error("Error accessing camera:", error);
+      alert("Unable to access camera. Please check permissions.");
+      setIsCameraActive(false);
     }
-  }
-
-  const startMediaPipeDetection = () => {
-    if (!handsRef.current || !videoRef.current) return
-
-    const camera = new (window as any).Camera(videoRef.current, {
-      onFrame: async () => {
-        if (handsRef.current && videoRef.current) {
-          await handsRef.current.send({ image: videoRef.current })
-        }
-      },
-      width: 640,
-      height: 480,
-    })
-    camera.start()
-  }
-
-  const startBasicDetection = () => {
-    // Fallback to basic detection if MediaPipe fails
-    const detectGestures = () => {
-      if (!isCameraActive || !videoRef.current || !canvasRef.current) {
-        return
-      }
-
-      // Simple finger counting simulation
-      const simulatedFingerCount = Math.floor(Math.random() * 6)
-      setFingerCount(simulatedFingerCount)
-      setHandDetected(simulatedFingerCount > 0)
-
-      if (simulatedFingerCount > 0) {
-        let gesture = ""
-        switch (simulatedFingerCount) {
-          case 0:
-            gesture = "Closed Fist"
-            break
-          case 1:
-            gesture = "One Finger"
-            break
-          case 2:
-            gesture = "Two Fingers"
-            break
-          case 3:
-            gesture = "Three Fingers"
-            break
-          case 5:
-            gesture = "Open Palm"
-            break
-        }
-
-        if (gesture) {
-          setDetectedGesture(gesture)
-          setConfidence(0.8)
-
-          const command = gestureCommands.find((cmd) => cmd.gesture === gesture)
-          if (command && Math.random() > 0.7) {
-            processGestureCommand(command)
-          }
-        }
-      }
-
-      animationRef.current = requestAnimationFrame(detectGestures)
-    }
-
-    detectGestures()
-  }
+  };
 
   const stopCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop())
-      streamRef.current = null
+      setIsCameraActive(false);
+      if (videoRef.current?.srcObject) {
+          (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
+          videoRef.current.srcObject = null;
+      }
+      if (animationFrameId.current) {
+        cancelAnimationFrame(animationFrameId.current);
+        animationFrameId.current = null;
+      }
+      const canvasCtx = canvasRef.current?.getContext("2d");
+      if (canvasCtx) {
+          canvasCtx.clearRect(0,0, canvasRef.current!.width, canvasRef.current!.height);
+      }
+      setDetectedGesture("");
+      setConfidence(0);
+      setHandDetected(false);
+      setFingerCount(0);
+  };
+
+  const predictWebcam = () => {
+    const video = videoRef.current;
+    if (!video || !handLandmarker) return;
+
+    if (video.paused || video.ended) {
+        return;
     }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null
+    
+    let startTimeMs = performance.now();
+    const results = handLandmarker.detectForVideo(video, startTimeMs);
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const canvasCtx = canvas.getContext("2d");
+    if (!canvasCtx) return;
+
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+    const drawingUtils = new DrawingUtils(canvasCtx);
+
+    if (results.landmarks && results.landmarks.length > 0) {
+        setHandDetected(true);
+        const landmarks = results.landmarks[0];
+
+        drawingUtils.drawLandmarks(landmarks, { color: "#FF0000", lineWidth: 1, radius: 3 });
+        drawingUtils.drawConnectors(landmarks, HandLandmarker.HAND_CONNECTIONS, { color: "#00FF00", lineWidth: 2 });
+
+        const fingers = countFingers(landmarks);
+        setFingerCount(fingers);
+
+        const gesture = detectGesture(landmarks, fingers);
+        if (gesture.name && gesture.confidence > 0.7) {
+            setDetectedGesture(gesture.name);
+            setConfidence(gesture.confidence);
+
+            if (gesture.confidence > 0.85) {
+                const command = gestureCommands.find((cmd) => cmd.gesture === gesture.name);
+                if (command) processGestureCommand(command);
+            }
+        } else {
+            if (confidence > 0) setConfidence(Math.max(0, confidence - 0.1));
+            if (confidence < 0.3) setDetectedGesture("");
+        }
+    } else {
+        setHandDetected(false);
+        setFingerCount(0);
+        setDetectedGesture("");
+        setConfidence(0);
     }
-    if (animationRef.current) {
-      cancelAnimationFrame(animationRef.current)
+    canvasCtx.restore();
+
+    if (isCameraActive) {
+      animationFrameId.current = requestAnimationFrame(predictWebcam);
     }
-    setIsCameraActive(false)
-    setDetectedGesture("")
-    setConfidence(0)
-    setHandDetected(false)
-    setFingerCount(0)
-  }
+  };
+
+  const countFingers = (landmarks: any[]) => {
+    // ... (Your finger counting logic here - it should work as is)
+    if (!landmarks || landmarks.length < 21) return 0;
+    let fingers = 0;
+    const tipIds = [4, 8, 12, 16, 20];
+    // Thumb
+    if (landmarks[tipIds[0]].x < landmarks[tipIds[0] - 1].x) fingers++;
+    // 4 Fingers
+    for (let i = 1; i < 5; i++) {
+        if (landmarks[tipIds[i]].y < landmarks[tipIds[i] - 2].y) fingers++;
+    }
+    return fingers;
+  };
+
+  const detectGesture = (landmarks: any[], fingerCount: number) => {
+    // ... (Your gesture detection logic here - it should work as is)
+     if (!landmarks || landmarks.length < 21) return { name: "", confidence: 0 };
+    let gestureName = "";
+    let confidence = 0;
+    switch (fingerCount) {
+        case 0: gestureName = "Closed Fist"; confidence = 0.9; break;
+        case 1:
+            if (landmarks[4].y < landmarks[3].y && landmarks[8].y > landmarks[6].y) {
+                gestureName = "Thumbs Up";
+                confidence = 0.85;
+            } else if (landmarks[8].y < landmarks[6].y) {
+                gestureName = "One Finger";
+                confidence = 0.8;
+            }
+            break;
+        case 2: gestureName = "Two Fingers"; confidence = 0.8; break;
+        case 3: gestureName = "Three Fingers"; confidence = 0.8; break;
+        case 5: gestureName = "Open Palm"; confidence = 0.9; break;
+        default: gestureName = ""; confidence = 0;
+    }
+    return { name: gestureName, confidence };
+  };
 
   const processGestureCommand = (command: GestureCommand) => {
-    if (isProcessing) return
-
-    setIsProcessing(true)
-
+    // ... (Your command processing logic here - it should work as is)
+    if (isProcessing) return;
+    setIsProcessing(true);
     setTimeout(() => {
-      let responseText = ""
-      switch (command.action) {
-        case "balance":
-          responseText = "Your account balance is $2,847.32"
-          break
-        case "transactions":
-          responseText = "Last transaction: $45.67 at Metro Grocery"
-          break
-        case "transfer":
-          responseText = "Transfer mode activated. Show amount with fingers."
-          break
-        case "confirm":
-          responseText = "Action confirmed successfully!"
-          break
-        case "emergency":
-          responseText = "EMERGENCY: Account locked immediately!"
-          break
-        case "help":
-          responseText = "Showing gesture commands menu"
-          break
-        default:
-          responseText = "Gesture recognized but no action assigned"
-      }
-
-      setResponse(responseText)
-      setIsProcessing(false)
-
-      // Trigger haptic feedback
-      if ("vibrate" in navigator) {
-        if (command.action === "emergency") {
-          navigator.vibrate([200, 100, 200, 100, 200])
-        } else {
-          navigator.vibrate([100, 50, 100])
+        let responseText = "";
+        switch (command.action) {
+            case "balance": responseText = "Your account balance is $2,847.32"; break;
+            case "transactions": responseText = "Last transaction: $45.67 at Metro Grocery"; break;
+            case "transfer": responseText = "Transfer mode activated. Show amount with fingers."; break;
+            case "confirm": responseText = "Action confirmed successfully!"; break;
+            case "emergency": responseText = "EMERGENCY: Account locked immediately!"; break;
+            case "help": responseText = "Showing gesture commands menu"; break;
+            default: responseText = "Gesture recognized but no action assigned";
         }
-      }
-
-      // Speak the response
-      if ("speechSynthesis" in window) {
-        const utterance = new SpeechSynthesisUtterance(responseText)
-        utterance.rate = 0.9
-        speechSynthesis.speak(utterance)
-      }
-
-      setTimeout(() => {
-        setResponse("")
-      }, 5000)
-    }, 1000)
-  }
+        setResponse(responseText);
+        setIsProcessing(false);
+        if ("vibrate" in navigator) {
+            if (command.action === "emergency") navigator.vibrate([200, 100, 200, 100, 200]);
+            else navigator.vibrate([100, 50, 100]);
+        }
+        if ("speechSynthesis" in window) {
+            const utterance = new SpeechSynthesisUtterance(responseText);
+            utterance.rate = 0.9;
+            speechSynthesis.speak(utterance);
+        }
+        setTimeout(() => setResponse(""), 5000);
+    }, 1000);
+  };
 
   return (
+    // ... (Your JSX for the page UI here - it should work as is)
     <div className="min-h-screen bg-gradient-to-br from-green-50 to-emerald-100">
       {/* Header */}
       <header className="bg-white shadow-sm border-b">
@@ -398,8 +266,8 @@ export default function SignLanguagePage() {
               <Badge variant={cameraSupported ? "default" : "destructive"}>
                 {cameraSupported ? "Camera Ready" : "Camera Not Supported"}
               </Badge>
-              <Badge variant={mediaPipeLoaded ? "default" : "secondary"}>
-                {isLoading ? "Loading AI..." : mediaPipeLoaded ? "AI Ready" : "Basic Mode"}
+              <Badge variant={!isLoading ? "default" : "secondary"}>
+                {isLoading ? "Loading AI..." : "AI Ready"}
               </Badge>
             </div>
           </div>
@@ -416,14 +284,14 @@ export default function SignLanguagePage() {
                 <span>AI Hand Detection</span>
               </CardTitle>
               <CardDescription>
-                {mediaPipeLoaded ? "Using MediaPipe AI for accurate hand tracking" : "Using basic detection mode"}
+                 Using MediaPipe for accurate hand tracking
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               {/* Video Feed */}
               <div className="relative bg-gray-900 rounded-lg overflow-hidden aspect-video">
-                <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
-                <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
+                <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover transform scaleX(-1)" />
+                <canvas ref={canvasRef} className="absolute inset-0 w-full h-full transform scaleX(-1)" />
 
                 {!isCameraActive && (
                   <div className="absolute inset-0 flex items-center justify-center">
@@ -581,8 +449,8 @@ export default function SignLanguagePage() {
               <CardContent>
                 <div className="space-y-3 text-sm">
                   <div className="flex items-center space-x-2">
-                    <div className={`w-2 h-2 rounded-full ${mediaPipeLoaded ? "bg-green-500" : "bg-yellow-500"}`}></div>
-                    <span>{mediaPipeLoaded ? "MediaPipe AI hand tracking" : "Basic finger detection"}</span>
+                    <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+                    <span>MediaPipe AI hand tracking</span>
                   </div>
                   <div className="flex items-center space-x-2">
                     <div className="w-2 h-2 bg-blue-500 rounded-full"></div>
