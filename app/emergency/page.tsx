@@ -269,4 +269,6 @@ export default function EmergencyPage() {
           </CardContent>
         </Card>
       </main>
-    \
+    </div>
+  )
+}
